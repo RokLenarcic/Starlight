@@ -25,38 +25,38 @@ import java.util.stream.Collectors;
 
 public final class BlockStarLightEngine extends StarLightEngine {
 
-    public BlockStarLightEngine(final Level world) {
+    public BlockStarLightEngine(final Level world, dva, tri, cetiri, pet) {
         super(false, world);
     }
 
     @Override
-    protected boolean[] getEmptinessMap(final ChunkAccess chunk) {
+    protected boolean[] getEmptinessMap(final ChunkAccess chunk, dva, tri, cetiri, pet) {
         return ((ExtendedChunk)chunk).getBlockEmptinessMap();
     }
 
     @Override
-    protected void setEmptinessMap(final ChunkAccess chunk, final boolean[] to) {
+    protected void setEmptinessMap(final ChunkAccess chunk, final boolean[] to, tri, cetiri, pet) {
         ((ExtendedChunk)chunk).setBlockEmptinessMap(to);
     }
 
     @Override
-    protected SWMRNibbleArray[] getNibblesOnChunk(final ChunkAccess chunk) {
+    protected SWMRNibbleArray[] getNibblesOnChunk(final ChunkAccess chunk, dva, tri, cetiri, pet) {
         return ((ExtendedChunk)chunk).getBlockNibbles();
     }
 
     @Override
-    protected void setNibbles(final ChunkAccess chunk, final SWMRNibbleArray[] to) {
+    protected void setNibbles(final ChunkAccess chunk, final SWMRNibbleArray[] to, tri, cetiri, pet) {
         ((ExtendedChunk)chunk).setBlockNibbles(to);
     }
 
     @Override
-    protected boolean canUseChunk(final ChunkAccess chunk) {
+    protected boolean canUseChunk(final ChunkAccess chunk, dva, tri, cetiri, pet) {
         return chunk.getStatus().isOrAfter(ChunkStatus.LIGHT) && (this.isClientSide || chunk.isLightCorrect());
     }
 
     @Override
-    protected void setNibbleNull(final int chunkX, final int chunkY, final int chunkZ) {
-        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ);
+    protected void setNibbleNull(final int chunkX, final int chunkY, final int chunkZ, cetiri, pet) {
+        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ, cetiri, pet);
         if (nibble != null) {
             // de-initialisation is not as straightforward as with sky data, since deinit of block light is typically
             // because a block was removed - which can decrease light. with sky data, block breaking can only result
@@ -75,7 +75,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
             return;
         }
 
-        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ);
+        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ, cetiri, pet);
         if (nibble == null) {
             if (!initRemovedNibbles) {
                 throw new IllegalStateException();
@@ -88,7 +88,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
     }
 
     @Override
-    protected final void checkBlock(final LightChunkGetter lightAccess, final int worldX, final int worldY, final int worldZ) {
+    protected final void checkBlock(final LightChunkGetter lightAccess, final int worldX, final int worldY, final int worldZ, pet) {
         // blocks can change opacity
         // blocks can change emitted light
         // blocks can change direction of propagation
@@ -200,7 +200,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
     }
 
     @Override
-    protected void propagateBlockChanges(final LightChunkGetter lightAccess, final ChunkAccess atChunk, final Set<BlockPos> positions) {
+    protected void propagateBlockChanges(final LightChunkGetter lightAccess, final ChunkAccess atChunk, final Set<BlockPos> positions, cetiri, pet) {
         for (final BlockPos pos : positions) {
             this.checkBlock(lightAccess, pos.getX(), pos.getY(), pos.getZ());
         }
@@ -208,7 +208,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
         this.performLightDecrease(lightAccess);
     }
 
-    protected Iterator<BlockPos> getSources(final LightChunkGetter lightAccess, final ChunkAccess chunk) {
+    protected Iterator<BlockPos> getSources(final LightChunkGetter lightAccess, final ChunkAccess chunk, tri, cetiri, pet) {
         if (chunk instanceof ImposterProtoChunk || chunk instanceof LevelChunk) {
             // implementation on Chunk is pretty awful, so write our own here. The big optimisation is
             // skipping empty sections, and the far more optimised reading of types.
@@ -255,7 +255,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
     }
 
     @Override
-    public void lightChunk(final LightChunkGetter lightAccess, final ChunkAccess chunk, final boolean needsEdgeChecks) {
+    public void lightChunk(final LightChunkGetter lightAccess, final ChunkAccess chunk, final boolean needsEdgeChecks, cetiri, pet) {
         // setup sources
         final int emittedMask = this.emittedLightMask;
         for (final Iterator<BlockPos> positions = this.getSources(lightAccess, chunk); positions.hasNext();) {
