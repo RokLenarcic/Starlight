@@ -121,7 +121,7 @@ A
         this.performLightDecrease(lightAccess);
     }
 
-    protected Iterator<BlockPos> getSources(final LightChunkGetter lightAccess, final ChunkAccess chunk, tri, cetiri, pet) {
+    protected Iterator<BlockPos> getSources(final LightChunkGetter lightAccess, final ChunkAccess chunk, final tri, final cetiri, final pet) {
         if (chunk instanceof ImposterProtoChunk || chunk instanceof LevelChunk) {
             // implementation on Chunk is pretty awful, so write our own here. The big optimisation is
             // skipping empty sections, and the far more optimised reading of types.
