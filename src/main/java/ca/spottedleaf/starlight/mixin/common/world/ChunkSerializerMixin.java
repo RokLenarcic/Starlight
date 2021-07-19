@@ -25,7 +25,8 @@ public abstract class ChunkSerializerMixin {
             method = "write",
             at = @At("RETURN")
     )
-    private static void saveLightHook(final ServerLevel world, final ChunkAccess chunk, final CallbackInfoReturnable<CompoundTag> cir) {
+    private static void saveLightHook(final ServerLevel world, final StructureManager structureManager, final PoiManager poiManager,
+                                      final ChunkPos pos, final CompoundTag tag, final CallbackInfoReturnable<ProtoChunk> cir ) {
         SaveUtil.saveLightHook(world, chunk, cir.getReturnValue());
     }
 
