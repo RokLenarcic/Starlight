@@ -70,22 +70,6 @@ public final class BlockStarLightEngine extends StarLightEngine {
     }
 
     @Override
-    protected void initNibble(final int chunkX, final int chunkY, final int chunkZ, final boolean extrude, final boolean initRemovedNibbles) {
-        if (chunkY < this.minLightSection || chunkY > this.maxLightSection || this.getChunkInCache(chunkX, chunkZ) == null) {
-            return;
-        }
-
-        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ, cetiri, pet);
-        if (nibble == null) {
-            if (!initRemovedNibbles) {
-                throw new IllegalStateException();
-            } else {
-                this.setNibbleInCache(chunkX, chunkY, chunkZ, new SWMRNibbleArray());
-            }
-        } else {
-            nibble.setNonNull();
-        }
-    }
 
     @Override
     protected final void checkBlock(final LightChunkGetter lightAccess, final int worldX, final int worldY, final int worldZ, pet) {
@@ -127,78 +111,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
 
     protected final BlockPos.MutableBlockPos recalcCenterPos = new BlockPos.MutableBlockPos();
     protected final BlockPos.MutableBlockPos recalcNeighbourPos = new BlockPos.MutableBlockPos();
-
-    @Override
-    protected int calculateLightValue(final LightChunkGetter lightAccess, final int worldX, final int worldY, final int worldZ,
-                                      final int expect) {
-        final BlockState centerState = this.getBlockState(worldX, worldY, worldZ);
-        int level = centerState.getLightEmission() & 0xF;
-
-        if (level >= (15 - 1) || level > expect) {
-            return level;
-        }
-
-        final int sectionOffset = this.chunkSectionIndexOffset;
-        final BlockState conditionallyOpaqueState;
-        int opacity = ((ExtendedAbstractBlockState)centerState).getOpacityIfCached();
-
-        if (opacity == -1) {
-            this.recalcCenterPos.set(worldX, worldY, worldZ);
-            opacity = centerState.getLightBlock(lightAccess.getLevel(), this.recalcCenterPos);
-            if (((ExtendedAbstractBlockState)centerState).isConditionallyFullOpaque()) {
-                conditionallyOpaqueState = centerState;
-            } else {
-                conditionallyOpaqueState = null;
-            }
-        } else if (opacity >= 15) {
-            return level;
-        } else {
-            conditionallyOpaqueState = null;
-        }
-        opacity = Math.max(1, opacity);
-
-        for (final AxisDirection direction : AXIS_DIRECTIONS) {
-            final int offX = worldX + direction.x;
-            final int offY = worldY + direction.y;
-            final int offZ = worldZ + direction.z;
-
-            final int sectionIndex = (offX >> 4) + 5 * (offZ >> 4) + (5 * 5) * (offY >> 4) + sectionOffset;
-
-            final int neighbourLevel = this.getLightLevel(sectionIndex, (offX & 15) | ((offZ & 15) << 4) | ((offY & 15) << 8));
-
-            if ((neighbourLevel - 1) <= level) {
-                // don't need to test transparency, we know it wont affect the result.
-                continue;
-            }
-
-            final long neighbourOpacity = this.getKnownTransparency(sectionIndex, (offY & 15) | ((offX & 15) << 4) | ((offZ & 15) << 8));
-
-            if (neighbourOpacity == ExtendedChunkSection.BLOCK_SPECIAL_TRANSPARENCY) {
-                // here the block can be conditionally opaque (i.e light cannot propagate from it), so we need to test that
-                // we don't read the blockstate because most of the time this is false, so using the faster
-                // known transparency lookup results in a net win
-                final BlockState neighbourState = this.getBlockState(offX, offY, offZ);
-                this.recalcNeighbourPos.set(offX, offY, offZ);
-                final VoxelShape neighbourFace = neighbourState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcNeighbourPos, direction.opposite.nms);
-                final VoxelShape thisFace = conditionallyOpaqueState == null ? Shapes.empty() : conditionallyOpaqueState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcCenterPos, direction.nms);
-                if (Shapes.faceShapeOccludes(thisFace, neighbourFace)) {
-                    // not allowed to propagate
-                    continue;
-                }
-            }
-
-            // passed transparency,
-
-            final int calculated = neighbourLevel - opacity;
-            level = Math.max(calculated, level);
-            if (level > expect) {
-                return level;
-            }
-        }
-
-        return level;
-    }
-
+A
     @Override
     protected void propagateBlockChanges(final LightChunkGetter lightAccess, final ChunkAccess atChunk, final Set<BlockPos> positions, cetiri, pet) {
         for (final BlockPos pos : positions) {
