@@ -1,3 +1,5 @@
+[![CodeScene general](https://staging.codescene.io/images/analyzed-by-codescene-badge.svg)](https://staging.codescene.io/projects/17169)
+
 Starlight (Fabric) (BETA)
 ==
 Fabric mod for completely rewriting the vanilla light engine.
@@ -72,3 +74,5 @@ So, If I wanted to fix them I would effectively have to end
 up rewriting most of the light engine, and at that point it's 
 easier to write a new one than rework the one old. The 
 Vanilla light engine simply had too many problems to fix.
+
+[![CodeScene Missed Goals](https://staging.codescene.io/projects/17169/status-badges/missed-goals)](https://staging.codescene.io/projects/17169)
