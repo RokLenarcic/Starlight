@@ -1,838 +1,916 @@
-package ca.spottedleaf.starlight.common.light;
+/*
+ * This file is part of Baritone.
+ *
+ * Baritone is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Baritone is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with Baritone.  If not, see <https://www.gnu.org/licenses/>.
+ */
 
-import ca.spottedleaf.starlight.common.blockstate.ExtendedAbstractBlockState;
-import ca.spottedleaf.starlight.common.chunk.ExtendedChunk;
-import ca.spottedleaf.starlight.common.chunk.ExtendedChunkSection;
-import ca.spottedleaf.starlight.common.util.WorldUtil;
-import it.unimi.dsi.fastutil.shorts.ShortCollection;
-import it.unimi.dsi.fastutil.shorts.ShortIterator;
-import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.BlockGetter;
-import net.minecraft.world.level.ChunkPos;
-import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.chunk.ChunkAccess;
-import net.minecraft.world.level.chunk.ChunkStatus;
-import net.minecraft.world.level.chunk.LevelChunkSection;
-import net.minecraft.world.level.chunk.LightChunkGetter;
-import net.minecraft.world.phys.shapes.Shapes;
-import net.minecraft.world.phys.shapes.VoxelShape;
-import java.util.Arrays;
-import java.util.Set;
+package baritone.process;
 
-public final class SkyStarLightEngine extends StarLightEngine {
+import baritone.Baritone;
+import baritone.api.pathing.goals.Goal;
+import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.pathing.goals.GoalComposite;
+import baritone.api.pathing.goals.GoalGetToBlock;
+import baritone.api.process.IBuilderProcess;
+import baritone.api.process.PathingCommand;
+import baritone.api.process.PathingCommandType;
+import baritone.api.schematic.FillSchematic;
+import baritone.api.schematic.ISchematic;
+import baritone.api.schematic.IStaticSchematic;
+import baritone.api.schematic.format.ISchematicFormat;
+import baritone.api.utils.BetterBlockPos;
+import baritone.api.utils.RayTraceUtils;
+import baritone.api.utils.Rotation;
+import baritone.api.utils.RotationUtils;
+import baritone.api.utils.input.Input;
+import baritone.pathing.movement.CalculationContext;
+import baritone.pathing.movement.Movement;
+import baritone.pathing.movement.MovementHelper;
+import baritone.utils.BaritoneProcessHelper;
+import baritone.utils.BlockStateInterface;
+import baritone.utils.NotificationHelper;
+import baritone.utils.PathingCommandContext;
+import baritone.utils.schematic.MapArtSchematic;
+import baritone.utils.schematic.SchematicSystem;
+import baritone.utils.schematic.schematica.SchematicaHelper;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import net.minecraft.block.BlockAir;
+import net.minecraft.block.BlockLiquid;
+import net.minecraft.block.state.IBlockState;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.item.ItemStack;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.Tuple;
+import net.minecraft.util.math.*;
 
-    /*
-      Specification for managing the initialisation and de-initialisation of skylight nibble arrays:
+import java.io.File;
+import java.io.FileInputStream;
+import java.util.*;
+import java.util.stream.Collectors;
 
-      Skylight nibble initialisation requires that non-empty chunk sections have 1 radius nibbles non-null.
+import static baritone.api.pathing.movement.ActionCosts.COST_INF;
 
-      This presents some problems, as vanilla is only guaranteed to have 0 radius neighbours loaded when editing blocks.
-      However starlight fixes this so that it has 1 radius loaded. Still, we don't actually have guarantees
-      that we have the necessary chunks loaded to de-initialise neighbour sections (but we do have enough to de-initialise
-      our own) - we need a radius of 2 to de-initialise neighbour nibbles.
-      How do we solve this?
+public final class BuilderProcess extends BaritoneProcessHelper implements IBuilderProcess {
 
-      Each chunk will store the last known "emptiness" of sections for each of their 1 radius neighbour chunk sections.
-      If the chunk does not have full data, then its nibbles are NOT de-initialised. This is because obviously the
-      chunk did not go through the light stage yet - or its neighbours are not lit. In either case, once the last
-      known "emptiness" of neighbouring sections is filled with data, the chunk will run a full check of the data
-      to see if any of its nibbles need to be de-initialised.
+    private HashSet<BetterBlockPos> incorrectPositions;
+    private LongOpenHashSet observedCompleted; // positions that are completed even if they're out of render distance and we can't make sure right now
+    private String name;
+    private ISchematic realSchematic;
+    private ISchematic schematic;
+    private Vec3i origin;
+    private int ticks;
+    private boolean paused;
+    private int layer;
+    private int numRepeats;
+    private List<IBlockState> approxPlaceable;
 
-      The emptiness map allows us to de-initialise neighbour nibbles if the neighbour has it filled with data,
-      and if it doesn't have data then we know it will correctly de-initialise once it fills up.
-
-      Unlike vanilla, we store whether nibbles are uninitialised on disk - so we don't need any dumb hacking
-      around those.
-     */
-
-    protected final int[] heightMapBlockChange = new int[16 * 16];
-    {
-        Arrays.fill(this.heightMapBlockChange, Integer.MIN_VALUE); // clear heightmap
-    }
-
-    protected final boolean[] nullPropagationCheckCache;
-
-    public SkyStarLightEngine(final Level world) {
-        super(true, world);
-        this.nullPropagationCheckCache = new boolean[WorldUtil.getTotalLightSections(world)];
+    public BuilderProcess(Baritone baritone) {
+        super(baritone);
     }
 
     @Override
-    protected void initNibble(final int chunkX, final int chunkY, final int chunkZ, final boolean extrude, final boolean initRemovedNibbles) {
-        if (chunkY < this.minLightSection || chunkY > this.maxLightSection || this.getChunkInCache(chunkX, chunkZ) == null) {
-            return;
+    public void build(String name, ISchematic schematic, Vec3i origin) {
+        this.name = name;
+        this.schematic = schematic;
+        this.realSchematic = null;
+        int x = origin.getX();
+        int y = origin.getY();
+        int z = origin.getZ();
+        if (Baritone.settings().schematicOrientationX.value) {
+            x += schematic.widthX();
         }
-        SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ);
-        if (nibble == null) {
-            if (!initRemovedNibbles) {
-                throw new IllegalStateException();
-            } else {
-                this.setNibbleInCache(chunkX, chunkY, chunkZ, nibble = new SWMRNibbleArray(null, true));
-            }
+        if (Baritone.settings().schematicOrientationY.value) {
+            y += schematic.heightY();
         }
-        this.initNibble(nibble, chunkX, chunkY, chunkZ, extrude);
+        if (Baritone.settings().schematicOrientationZ.value) {
+            z += schematic.lengthZ();
+        }
+        this.origin = new Vec3i(x, y, z);
+        this.paused = false;
+        this.layer = Baritone.settings().startAtLayer.value;
+        this.numRepeats = 0;
+        this.observedCompleted = new LongOpenHashSet();
+    }
+
+    public void resume() {
+        paused = false;
+    }
+
+    public void pause() {
+        paused = true;
     }
 
     @Override
-    protected void setNibbleNull(final int chunkX, final int chunkY, final int chunkZ) {
-        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ);
-        if (nibble != null) {
-            nibble.setNull();
-        }
+    public boolean isPaused() {
+        return paused;
     }
 
-    protected final void initNibble(final SWMRNibbleArray currNibble, final int chunkX, final int chunkY, final int chunkZ, final boolean extrude) {
-        if (!currNibble.isNullNibbleUpdating()) {
-            // already initialised
-            return;
-        }
-
-        final boolean[] emptinessMap = this.getEmptinessMap(chunkX, chunkZ);
-
-        // are we above this chunk's lowest empty section?
-        int lowestY = this.minLightSection - 1;
-        for (int currY = this.maxSection; currY >= this.minSection; --currY) {
-            if (emptinessMap == null) {
-                // cannot delay nibble init for lit chunks, as we need to init to propagate into them.
-                final LevelChunkSection current = this.getChunkSection(chunkX, currY, chunkZ);
-                if (current == null || current == EMPTY_CHUNK_SECTION) {
-                    continue;
-                }
-            } else {
-                if (emptinessMap[currY - this.minSection]) {
-                    continue;
-                }
-            }
-
-            // should always be full lit here
-            lowestY = currY;
-            break;
-        }
-
-        if (chunkY > lowestY) {
-            // we need to set this one to full
-            final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ);
-            nibble.setNonNull();
-            nibble.setFull();
-            return;
-        }
-
-        if (extrude) {
-            // this nibble is going to depend solely on the skylight data above it
-            // find first non-null data above (there does exist one, as we just found it above)
-            for (int currY = chunkY + 1; currY <= this.maxLightSection; ++currY) {
-                final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, currY, chunkZ);
-                if (nibble != null && !nibble.isNullNibbleUpdating()) {
-                    currNibble.setNonNull();
-                    currNibble.extrudeLower(nibble);
-                    break;
-                }
-            }
-        } else {
-            currNibble.setNonNull();
-        }
-    }
-
-    protected final void rewriteNibbleCacheForSkylight(final ChunkAccess chunk) {
-        for (int index = 0, max = this.nibbleCache.length; index < max; ++index) {
-            final SWMRNibbleArray nibble = this.nibbleCache[index];
-            if (nibble != null && nibble.isNullNibbleUpdating()) {
-                // stop propagation in these areas
-                this.nibbleCache[index] = null;
-                nibble.updateVisible();
-            }
-        }
-    }
-
-    // rets whether neighbours were init'd
-
-    protected final boolean checkNullSection(final int chunkX, final int chunkY, final int chunkZ,
-                                             final boolean extrudeInitialised) {
-        // null chunk sections may have nibble neighbours in the horizontal 1 radius that are
-        // non-null. Propagation to these neighbours is necessary.
-        // What makes this easy is we know none of these neighbours are non-empty (otherwise
-        // this nibble would be initialised). So, we don't have to initialise
-        // the neighbours in the full 1 radius, because there's no worry that any "paths"
-        // to the neighbours on this horizontal plane are blocked.
-        if (chunkY < this.minLightSection || chunkY > this.maxLightSection || this.nullPropagationCheckCache[chunkY - this.minLightSection]) {
+    @Override
+    public boolean build(String name, File schematic, Vec3i origin) {
+        Optional<ISchematicFormat> format = SchematicSystem.INSTANCE.getByFile(schematic);
+        if (!format.isPresent()) {
             return false;
         }
-        this.nullPropagationCheckCache[chunkY - this.minLightSection] = true;
 
-        // check horizontal neighbours
-        boolean needInitNeighbours = false;
-        neighbour_search:
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                final SWMRNibbleArray nibble = this.getNibbleFromCache(dx + chunkX, chunkY, dz + chunkZ);
-                if (nibble != null && !nibble.isNullNibbleUpdating()) {
-                    needInitNeighbours = true;
-                    break neighbour_search;
-                }
+        ISchematic parsed;
+        try {
+            parsed = format.get().parse(new FileInputStream(schematic));
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false;
+        }
+
+        if (Baritone.settings().mapArtMode.value) {
+            parsed = new MapArtSchematic((IStaticSchematic) parsed);
+        }
+
+        build(name, parsed, origin);
+        return true;
+    }
+
+    @Override
+    public void buildOpenSchematic() {
+        if (SchematicaHelper.isSchematicaPresent()) {
+            Optional<Tuple<IStaticSchematic, BlockPos>> schematic = SchematicaHelper.getOpenSchematic();
+            if (schematic.isPresent()) {
+                IStaticSchematic s = schematic.get().getFirst();
+                this.build(
+                        schematic.get().getFirst().toString(),
+                        Baritone.settings().mapArtMode.value ? new MapArtSchematic(s) : s,
+                        schematic.get().getSecond()
+                );
+            } else {
+                logDirect("No schematic currently open");
             }
-        }
-
-        if (needInitNeighbours) {
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    this.initNibble(dx + chunkX, chunkY, dz + chunkZ, (dx | dz) == 0 ? extrudeInitialised : true, true);
-                }
-            }
-        }
-
-        return needInitNeighbours;
-    }
-
-    protected final int getLightLevelExtruded(final int worldX, final int worldY, final int worldZ) {
-        final int chunkX = worldX >> 4;
-        int chunkY = worldY >> 4;
-        final int chunkZ = worldZ >> 4;
-
-        SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ);
-        if (nibble != null) {
-            return nibble.getUpdating(worldX, worldY, worldZ);
-        }
-
-        for (;;) {
-            if (++chunkY > this.maxLightSection) {
-                return 15;
-            }
-
-            nibble = this.getNibbleFromCache(chunkX, chunkY, chunkZ);
-
-            if (nibble != null) {
-                return nibble.getUpdating(worldX, 0, worldZ);
-            }
-        }
-    }
-
-    @Override
-    protected boolean[] getEmptinessMap(final ChunkAccess chunk) {
-        return ((ExtendedChunk)chunk).getSkyEmptinessMap();
-    }
-
-    @Override
-    protected void setEmptinessMap(final ChunkAccess chunk, final boolean[] to) {
-        ((ExtendedChunk)chunk).setSkyEmptinessMap(to);
-    }
-
-    @Override
-    protected SWMRNibbleArray[] getNibblesOnChunk(final ChunkAccess chunk) {
-        return ((ExtendedChunk)chunk).getSkyNibbles();
-    }
-
-    @Override
-    protected void setNibbles(final ChunkAccess chunk, final SWMRNibbleArray[] to) {
-        ((ExtendedChunk)chunk).setSkyNibbles(to);
-    }
-
-    @Override
-    protected boolean canUseChunk(final ChunkAccess chunk) {
-        // can only use chunks for sky stuff if their sections have been init'd
-        return chunk.getStatus().isOrAfter(ChunkStatus.LIGHT) && (this.isClientSide || chunk.isLightCorrect());
-    }
-
-    @Override
-    protected void checkChunkEdges(final LightChunkGetter lightAccess, final ChunkAccess chunk, final int fromSection,
-                                   final int toSection) {
-        Arrays.fill(this.nullPropagationCheckCache, false);
-        this.rewriteNibbleCacheForSkylight(chunk);
-        final int chunkX = chunk.getPos().x;
-        final int chunkZ = chunk.getPos().z;
-        for (int y = toSection; y >= fromSection; --y) {
-            this.checkNullSection(chunkX, y, chunkZ, true);
-        }
-
-        super.checkChunkEdges(lightAccess, chunk, fromSection, toSection);
-    }
-
-    @Override
-    protected void checkChunkEdges(final LightChunkGetter lightAccess, final ChunkAccess chunk, final ShortCollection sections) {
-        Arrays.fill(this.nullPropagationCheckCache, false);
-        this.rewriteNibbleCacheForSkylight(chunk);
-        final int chunkX = chunk.getPos().x;
-        final int chunkZ = chunk.getPos().z;
-        for (final ShortIterator iterator = sections.iterator(); iterator.hasNext();) {
-            final int y = (int)iterator.nextShort();
-            this.checkNullSection(chunkX, y, chunkZ, true);
-        }
-
-        super.checkChunkEdges(lightAccess, chunk, sections);
-    }
-
-    @Override
-    protected void checkBlock(final LightChunkGetter lightAccess, final int worldX, final int worldY, final int worldZ) {
-        // blocks can change opacity
-        // blocks can change direction of propagation
-
-        // same logic applies from BlockStarLightEngine#checkBlock
-
-        final int encodeOffset = this.coordinateOffset;
-
-        final int currentLevel = this.getLightLevel(worldX, worldY, worldZ);
-
-        if (currentLevel == 15) {
-            // must re-propagate clobbered source
-            this.appendToIncreaseQueue(
-                    ((worldX + (worldZ << 6) + (worldY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
-                            | (currentLevel & 0xFL) << (6 + 6 + 16)
-                            | (((long)ALL_DIRECTIONS_BITSET) << (6 + 6 + 16 + 4))
-                            | FLAG_HAS_SIDED_TRANSPARENT_BLOCKS // don't know if the block is conditionally transparent
-            );
         } else {
-            this.setLightLevel(worldX, worldY, worldZ, 0);
+            logDirect("Schematica is not present");
         }
-
-        this.appendToDecreaseQueue(
-                ((worldX + (worldZ << 6) + (worldY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
-                        | (currentLevel & 0xFL) << (6 + 6 + 16)
-                        | (((long)ALL_DIRECTIONS_BITSET) << (6 + 6 + 16 + 4))
-        );
     }
 
-    protected final BlockPos.MutableBlockPos recalcCenterPos = new BlockPos.MutableBlockPos();
-    protected final BlockPos.MutableBlockPos recalcNeighbourPos = new BlockPos.MutableBlockPos();
-
-    @Override
-    protected int calculateLightValue(final LightChunkGetter lightAccess, final int worldX, final int worldY, final int worldZ,
-                                      final int expect) {
-        if (expect == 15) {
-            return expect;
-        }
-
-        final int sectionOffset = this.chunkSectionIndexOffset;
-        final int opacity;
-        final BlockState conditionallyOpaqueState;
-        switch ((int)this.getKnownTransparency(worldX, worldY, worldZ)) {
-            case (int)ExtendedChunkSection.BLOCK_IS_TRANSPARENT:
-                opacity = 1;
-                conditionallyOpaqueState = null;
-                break;
-            case (int)ExtendedChunkSection.BLOCK_IS_FULL_OPAQUE:
-                return 0;
-            case (int)ExtendedChunkSection.BLOCK_UNKNOWN_TRANSPARENCY:
-                opacity = Math.max(1, ((ExtendedAbstractBlockState)this.getBlockState(worldX, worldY, worldZ)).getOpacityIfCached());
-                conditionallyOpaqueState = null;
-                if (opacity >= 15) {
-                    return 0;
-                }
-                break;
-            // variable opacity | conditionally full opaque
-            case (int)ExtendedChunkSection.BLOCK_SPECIAL_TRANSPARENCY:
-            default:
-                this.recalcCenterPos.set(worldX, worldY, worldZ);
-                final BlockState state = this.getBlockState(worldX, worldY, worldZ);
-                opacity = Math.max(1, state.getLightBlock(lightAccess.getLevel(), this.recalcCenterPos));
-                if (((ExtendedAbstractBlockState)state).isConditionallyFullOpaque()) {
-                    conditionallyOpaqueState = state;
-                } else {
-                    conditionallyOpaqueState = null;
-                }
-        }
-
-        int level = 0;
-
-        for (final AxisDirection direction : AXIS_DIRECTIONS) {
-            final int offX = worldX + direction.x;
-            final int offY = worldY + direction.y;
-            final int offZ = worldZ + direction.z;
-
-            final int sectionIndex = (offX >> 4) + 5 * (offZ >> 4) + (5 * 5) * (offY >> 4) + sectionOffset;
-
-            final int neighbourLevel = this.getLightLevel(sectionIndex, (offX & 15) | ((offZ & 15) << 4) | ((offY & 15) << 8));
-
-            if ((neighbourLevel - 1) <= level) {
-                // don't need to test transparency, we know it wont affect the result.
-                continue;
-            }
-
-            final long neighbourOpacity = this.getKnownTransparency(sectionIndex, (offY & 15) | ((offX & 15) << 4) | ((offZ & 15) << 8));
-
-            if (neighbourOpacity == ExtendedChunkSection.BLOCK_SPECIAL_TRANSPARENCY) {
-                // here the block can be conditionally opaque (i.e light cannot propagate from it), so we need to test that
-                // we don't read the blockstate because most of the time this is false, so using the faster
-                // known transparency lookup results in a net win
-                final BlockState neighbourState = this.getBlockState(offX, offY, offZ);
-                this.recalcNeighbourPos.set(offX, offY, offZ);
-                final VoxelShape neighbourFace = neighbourState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcNeighbourPos, direction.opposite.nms);
-                final VoxelShape thisFace = conditionallyOpaqueState == null ? Shapes.empty() : conditionallyOpaqueState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcCenterPos, direction.nms);
-                if (Shapes.faceShapeOccludes(thisFace, neighbourFace)) {
-                    // not allowed to propagate
-                    continue;
-                }
-            }
-
-            final int calculated = neighbourLevel - opacity;
-            level = Math.max(calculated, level);
-            if (level > expect) {
-                return level;
-            }
-        }
-
-        return level;
+    public void clearArea(BlockPos corner1, BlockPos corner2) {
+        BlockPos origin = new BlockPos(Math.min(corner1.getX(), corner2.getX()), Math.min(corner1.getY(), corner2.getY()), Math.min(corner1.getZ(), corner2.getZ()));
+        int widthX = Math.abs(corner1.getX() - corner2.getX()) + 1;
+        int heightY = Math.abs(corner1.getY() - corner2.getY()) + 1;
+        int lengthZ = Math.abs(corner1.getZ() - corner2.getZ()) + 1;
+        build("clear area", new FillSchematic(widthX, heightY, lengthZ, Blocks.AIR.getDefaultState()), origin);
     }
 
     @Override
-    protected void propagateBlockChanges(final LightChunkGetter lightAccess, final ChunkAccess atChunk, final Set<BlockPos> positions) {
-        this.rewriteNibbleCacheForSkylight(atChunk);
-        Arrays.fill(this.nullPropagationCheckCache, false);
+    public List<IBlockState> getApproxPlaceable() {
+        return new ArrayList<>(approxPlaceable);
+    }
 
-        final BlockGetter world = lightAccess.getLevel();
-        final int chunkX = atChunk.getPos().x;
-        final int chunkZ = atChunk.getPos().z;
-        final int heightMapOffset = chunkX * -16 + (chunkZ * (-16 * 16));
+    @Override
+    public boolean isActive() {
+        return schematic != null;
+    }
 
-        // setup heightmap for changes
-        for (final BlockPos pos : positions) {
-            final int index = pos.getX() + (pos.getZ() << 4) + heightMapOffset;
-            final int curr = this.heightMapBlockChange[index];
-            if (pos.getY() > curr) {
-                this.heightMapBlockChange[index] = pos.getY();
-            }
+    public IBlockState placeAt(int x, int y, int z, IBlockState current) {
+        if (!isActive()) {
+            return null;
         }
+        if (!schematic.inSchematic(x - origin.getX(), y - origin.getY(), z - origin.getZ(), current)) {
+            return null;
+        }
+        IBlockState state = schematic.desiredState(x - origin.getX(), y - origin.getY(), z - origin.getZ(), current, this.approxPlaceable);
+        if (state.getBlock() == Blocks.AIR) {
+            return null;
+        }
+        return state;
+    }
 
-        // note: light sets are delayed while processing skylight source changes due to how
-        // nibbles are initialised, as we want to avoid clobbering nibble values so what when
-        // below nibbles are initialised they aren't reading from partially modified nibbles
-
-        // now we can recalculate the sources for the changed columns
-        for (int index = 0; index < (16 * 16); ++index) {
-            final int maxY = this.heightMapBlockChange[index];
-            if (maxY == Integer.MIN_VALUE) {
-                // not changed
-                continue;
-            }
-            this.heightMapBlockChange[index] = Integer.MIN_VALUE; // restore default for next caller
-
-            final int columnX = (index & 15) | (chunkX << 4);
-            final int columnZ = (index >>> 4) | (chunkZ << 4);
-
-            // try and propagate from the above y
-            // delay light set until after processing all sources to setup
-            final int maxPropagationY = this.tryPropagateSkylight(world, columnX, maxY, columnZ, true, true);
-
-            // maxPropagationY is now the highest block that could not be propagated to
-
-            // remove all sources below that are 15
-            final long propagateDirection = AxisDirection.POSITIVE_Y.everythingButThisDirection;
-            final int encodeOffset = this.coordinateOffset;
-
-            if (this.getLightLevelExtruded(columnX, maxPropagationY, columnZ) == 15) {
-                // ensure section is checked
-                this.checkNullSection(columnX >> 4, maxPropagationY >> 4, columnZ >> 4, true);
-
-                for (int currY = maxPropagationY; currY >= (this.minLightSection << 4); --currY) {
-                    if ((currY & 15) == 15) {
-                        // ensure section is checked
-                        this.checkNullSection(columnX >> 4, (currY >> 4), columnZ >> 4, true);
+    private Optional<Tuple<BetterBlockPos, Rotation>> toBreakNearPlayer(BuilderCalculationContext bcc) {
+        BetterBlockPos center = ctx.playerFeet();
+        BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
+        for (int dx = -5; dx <= 5; dx++) {
+            for (int dy = Baritone.settings().breakFromAbove.value ? -1 : 0; dy <= 5; dy++) {
+                for (int dz = -5; dz <= 5; dz++) {
+                    int x = center.x + dx;
+                    int y = center.y + dy;
+                    int z = center.z + dz;
+                    if (dy == -1 && x == pathStart.x && z == pathStart.z) {
+                        continue; // dont mine what we're supported by, but not directly standing on
                     }
+                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
+                    if (desired == null) {
+                        continue; // irrelevant
+                    }
+                    IBlockState curr = bcc.bsi.get0(x, y, z);
+                    if (curr.getBlock() != Blocks.AIR && !(curr.getBlock() instanceof BlockLiquid) && !valid(curr, desired, false)) {
+                        BetterBlockPos pos = new BetterBlockPos(x, y, z);
+                        Optional<Rotation> rot = RotationUtils.reachable(ctx.player(), pos, ctx.playerController().getBlockReachDistance());
+                        if (rot.isPresent()) {
+                            return Optional.of(new Tuple<>(pos, rot.get()));
+                        }
+                    }
+                }
+            }
+        }
+        return Optional.empty();
+    }
 
-                    // ensure section below is always checked
-                    final SWMRNibbleArray nibble = this.getNibbleFromCache(columnX >> 4, currY >> 4, columnZ >> 4);
-                    if (nibble == null) {
-                        // advance currY to the the top of the section below
-                        currY = (currY) & (~15);
-                        // note: this value ^ is actually 1 above the top, but the loop decrements by 1 so we actually
-                        // end up there
+    public static class Placement {
+
+        private final int hotbarSelection;
+        private final BlockPos placeAgainst;
+        private final EnumFacing side;
+        private final Rotation rot;
+
+        public Placement(int hotbarSelection, BlockPos placeAgainst, EnumFacing side, Rotation rot) {
+            this.hotbarSelection = hotbarSelection;
+            this.placeAgainst = placeAgainst;
+            this.side = side;
+            this.rot = rot;
+        }
+    }
+
+    private Optional<Placement> searchForPlaceables(BuilderCalculationContext bcc, List<IBlockState> desirableOnHotbar) {
+        BetterBlockPos center = ctx.playerFeet();
+        for (int dx = -5; dx <= 5; dx++) {
+            for (int dy = -5; dy <= 1; dy++) {
+                for (int dz = -5; dz <= 5; dz++) {
+                    int x = center.x + dx;
+                    int y = center.y + dy;
+                    int z = center.z + dz;
+                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
+                    if (desired == null) {
+                        continue; // irrelevant
+                    }
+                    IBlockState curr = bcc.bsi.get0(x, y, z);
+                    if (MovementHelper.isReplaceable(x, y, z, curr, bcc.bsi) && !valid(curr, desired, false)) {
+                        if (dy == 1 && bcc.bsi.get0(x, y + 1, z).getBlock() == Blocks.AIR) {
+                            continue;
+                        }
+                        desirableOnHotbar.add(desired);
+                        Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
+                        if (opt.isPresent()) {
+                            return opt;
+                        }
+                    }
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private Optional<Placement> possibleToPlace(IBlockState toPlace, int x, int y, int z, BlockStateInterface bsi) {
+        for (EnumFacing against : EnumFacing.values()) {
+            BetterBlockPos placeAgainstPos = new BetterBlockPos(x, y, z).offset(against);
+            IBlockState placeAgainstState = bsi.get0(placeAgainstPos);
+            if (MovementHelper.isReplaceable(placeAgainstPos.x, placeAgainstPos.y, placeAgainstPos.z, placeAgainstState, bsi)) {
+                continue;
+            }
+            if (!ctx.world().mayPlace(toPlace.getBlock(), new BetterBlockPos(x, y, z), false, against, null)) {
+                continue;
+            }
+            AxisAlignedBB aabb = placeAgainstState.getBoundingBox(ctx.world(), placeAgainstPos);
+            for (Vec3d placementMultiplier : aabbSideMultipliers(against)) {
+                double placeX = placeAgainstPos.x + aabb.minX * placementMultiplier.x + aabb.maxX * (1 - placementMultiplier.x);
+                double placeY = placeAgainstPos.y + aabb.minY * placementMultiplier.y + aabb.maxY * (1 - placementMultiplier.y);
+                double placeZ = placeAgainstPos.z + aabb.minZ * placementMultiplier.z + aabb.maxZ * (1 - placementMultiplier.z);
+                Rotation rot = RotationUtils.calcRotationFromVec3d(RayTraceUtils.inferSneakingEyePosition(ctx.player()), new Vec3d(placeX, placeY, placeZ), ctx.playerRotations());
+                RayTraceResult result = RayTraceUtils.rayTraceTowards(ctx.player(), rot, ctx.playerController().getBlockReachDistance(), true);
+                if (result != null && result.typeOfHit == RayTraceResult.Type.BLOCK && result.getBlockPos().equals(placeAgainstPos) && result.sideHit == against.getOpposite()) {
+                    OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, rot);
+                    if (hotbar.isPresent()) {
+                        return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot));
+                    }
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private OptionalInt hasAnyItemThatWouldPlace(IBlockState desired, RayTraceResult result, Rotation rot) {
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = ctx.player().inventory.mainInventory.get(i);
+            if (stack.isEmpty() || !(stack.getItem() instanceof ItemBlock)) {
+                continue;
+            }
+            float originalYaw = ctx.player().rotationYaw;
+            float originalPitch = ctx.player().rotationPitch;
+            // the state depends on the facing of the player sometimes
+            ctx.player().rotationYaw = rot.getYaw();
+            ctx.player().rotationPitch = rot.getPitch();
+            IBlockState wouldBePlaced = ((ItemBlock) stack.getItem()).getBlock().getStateForPlacement(
+                    ctx.world(),
+                    result.getBlockPos().offset(result.sideHit),
+                    result.sideHit,
+                    (float) result.hitVec.x - result.getBlockPos().getX(), // as in PlayerControllerMP
+                    (float) result.hitVec.y - result.getBlockPos().getY(),
+                    (float) result.hitVec.z - result.getBlockPos().getZ(),
+                    stack.getItem().getMetadata(stack.getMetadata()),
+                    ctx.player()
+            );
+            ctx.player().rotationYaw = originalYaw;
+            ctx.player().rotationPitch = originalPitch;
+            if (valid(wouldBePlaced, desired, true)) {
+                return OptionalInt.of(i);
+            }
+        }
+        return OptionalInt.empty();
+    }
+
+    private static Vec3d[] aabbSideMultipliers(EnumFacing side) {
+        switch (side) {
+            case UP:
+                return new Vec3d[]{new Vec3d(0.5, 1, 0.5), new Vec3d(0.1, 1, 0.5), new Vec3d(0.9, 1, 0.5), new Vec3d(0.5, 1, 0.1), new Vec3d(0.5, 1, 0.9)};
+            case DOWN:
+                return new Vec3d[]{new Vec3d(0.5, 0, 0.5), new Vec3d(0.1, 0, 0.5), new Vec3d(0.9, 0, 0.5), new Vec3d(0.5, 0, 0.1), new Vec3d(0.5, 0, 0.9)};
+            case NORTH:
+            case SOUTH:
+            case EAST:
+            case WEST:
+                double x = side.getXOffset() == 0 ? 0.5 : (1 + side.getXOffset()) / 2D;
+                double z = side.getZOffset() == 0 ? 0.5 : (1 + side.getZOffset()) / 2D;
+                return new Vec3d[]{new Vec3d(x, 0.25, z), new Vec3d(x, 0.75, z)};
+            default: // null
+                throw new IllegalStateException();
+        }
+    }
+
+    @Override
+    public PathingCommand onTick(boolean calcFailed, boolean isSafeToCancel) {
+        approxPlaceable = approxPlaceable(36);
+        if (baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_LEFT)) {
+            ticks = 5;
+        } else {
+            ticks--;
+        }
+        baritone.getInputOverrideHandler().clearAllKeys();
+        if (paused) {
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+        }
+        if (Baritone.settings().buildInLayers.value) {
+            if (realSchematic == null) {
+                realSchematic = schematic;
+            }
+            ISchematic realSchematic = this.realSchematic; // wrap this properly, dont just have the inner class refer to the builderprocess.this
+            int minYInclusive;
+            int maxYInclusive;
+            // layer = 0 should be nothing
+            // layer = realSchematic.heightY() should be everything
+            if (Baritone.settings().layerOrder.value) { // top to bottom
+                maxYInclusive = realSchematic.heightY() - 1;
+                minYInclusive = realSchematic.heightY() - layer;
+            } else {
+                maxYInclusive = layer - 1;
+                minYInclusive = 0;
+            }
+            schematic = new ISchematic() {
+                @Override
+                public IBlockState desiredState(int x, int y, int z, IBlockState current, List<IBlockState> approxPlaceable) {
+                    return realSchematic.desiredState(x, y, z, current, BuilderProcess.this.approxPlaceable);
+                }
+
+                @Override
+                public boolean inSchematic(int x, int y, int z, IBlockState currentState) {
+                    return ISchematic.super.inSchematic(x, y, z, currentState) && y >= minYInclusive && y <= maxYInclusive && realSchematic.inSchematic(x, y, z, currentState);
+                }
+
+                @Override
+                public int widthX() {
+                    return realSchematic.widthX();
+                }
+
+                @Override
+                public int heightY() {
+                    return realSchematic.heightY();
+                }
+
+                @Override
+                public int lengthZ() {
+                    return realSchematic.lengthZ();
+                }
+            };
+        }
+        BuilderCalculationContext bcc = new BuilderCalculationContext();
+        if (!recalc(bcc)) {
+            if (Baritone.settings().buildInLayers.value && layer < realSchematic.heightY()) {
+                logDirect("Starting layer " + layer);
+                layer++;
+                return onTick(calcFailed, isSafeToCancel);
+            }
+            Vec3i repeat = Baritone.settings().buildRepeat.value;
+            int max = Baritone.settings().buildRepeatCount.value;
+            numRepeats++;
+            if (repeat.equals(new Vec3i(0, 0, 0)) || (max != -1 && numRepeats >= max)) {
+                logDirect("Done building");
+                if (Baritone.settings().desktopNotifications.value && Baritone.settings().notificationOnBuildFinished.value) {
+                    NotificationHelper.notify("Done building", false);
+                }
+                onLostControl();
+                return null;
+            }
+            // build repeat time
+            layer = 0;
+            origin = new BlockPos(origin).add(repeat);
+            logDirect("Repeating build in vector " + repeat + ", new origin is " + origin);
+            return onTick(calcFailed, isSafeToCancel);
+        }
+        if (Baritone.settings().distanceTrim.value) {
+            trim();
+        }
+
+        Optional<Tuple<BetterBlockPos, Rotation>> toBreak = toBreakNearPlayer(bcc);
+        if (toBreak.isPresent() && isSafeToCancel && ctx.player().onGround) {
+            // we'd like to pause to break this block
+            // only change look direction if it's safe (don't want to fuck up an in progress parkour for example
+            Rotation rot = toBreak.get().getSecond();
+            BetterBlockPos pos = toBreak.get().getFirst();
+            baritone.getLookBehavior().updateTarget(rot, true);
+            MovementHelper.switchToBestToolFor(ctx, bcc.get(pos));
+            if (ctx.player().isSneaking()) {
+                // really horrible bug where a block is visible for breaking while sneaking but not otherwise
+                // so you can't see it, it goes to place something else, sneaks, then the next tick it tries to break
+                // and is unable since it's unsneaked in the intermediary tick
+                baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+            }
+            if (ctx.isLookingAt(pos) || ctx.playerRotations().isReallyCloseTo(rot)) {
+                baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
+            }
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+        }
+        List<IBlockState> desirableOnHotbar = new ArrayList<>();
+        Optional<Placement> toPlace = searchForPlaceables(bcc, desirableOnHotbar);
+        if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround && ticks <= 0) {
+            Rotation rot = toPlace.get().rot;
+            baritone.getLookBehavior().updateTarget(rot, true);
+            ctx.player().inventory.currentItem = toPlace.get().hotbarSelection;
+            baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+            if ((ctx.isLookingAt(toPlace.get().placeAgainst) && ctx.objectMouseOver().sideHit.equals(toPlace.get().side)) || ctx.playerRotations().isReallyCloseTo(rot)) {
+                baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
+            }
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+        }
+
+        if (Baritone.settings().allowInventory.value) {
+            ArrayList<Integer> usefulSlots = new ArrayList<>();
+            List<IBlockState> noValidHotbarOption = new ArrayList<>();
+            outer:
+            for (IBlockState desired : desirableOnHotbar) {
+                for (int i = 0; i < 9; i++) {
+                    if (valid(approxPlaceable.get(i), desired, true)) {
+                        usefulSlots.add(i);
+                        continue outer;
+                    }
+                }
+                noValidHotbarOption.add(desired);
+            }
+
+            outer:
+            for (int i = 9; i < 36; i++) {
+                for (IBlockState desired : noValidHotbarOption) {
+                    if (valid(approxPlaceable.get(i), desired, true)) {
+                        baritone.getInventoryBehavior().attemptToPutOnHotbar(i, usefulSlots::contains);
+                        break outer;
+                    }
+                }
+            }
+        }
+
+        Goal goal = assemble(bcc, approxPlaceable.subList(0, 9));
+        if (goal == null) {
+            goal = assemble(bcc, approxPlaceable, true); // we're far away, so assume that we have our whole inventory to recalculate placeable properly
+            if (goal == null) {
+                if (Baritone.settings().skipFailedLayers.value && Baritone.settings().buildInLayers.value && layer < realSchematic.heightY()) {
+                    logDirect("Skipping layer that I cannot construct! Layer #" + layer);
+                    layer++;
+                    return onTick(calcFailed, isSafeToCancel);
+                }
+                logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
+                paused = true;
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+        }
+        return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
+    }
+
+    private boolean recalc(BuilderCalculationContext bcc) {
+        if (incorrectPositions == null) {
+            incorrectPositions = new HashSet<>();
+            fullRecalc(bcc);
+            if (incorrectPositions.isEmpty()) {
+                return false;
+            }
+        }
+        recalcNearby(bcc);
+        if (incorrectPositions.isEmpty()) {
+            fullRecalc(bcc);
+        }
+        return !incorrectPositions.isEmpty();
+    }
+
+    private void trim() {
+        HashSet<BetterBlockPos> copy = new HashSet<>(incorrectPositions);
+        copy.removeIf(pos -> pos.distanceSq(ctx.player().posX, ctx.player().posY, ctx.player().posZ) > 200);
+        if (!copy.isEmpty()) {
+            incorrectPositions = copy;
+        }
+    }
+
+    private void recalcNearby(BuilderCalculationContext bcc) {
+        BetterBlockPos center = ctx.playerFeet();
+        int radius = Baritone.settings().builderTickScanRadius.value;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -radius; dy <= radius; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    int x = center.x + dx;
+                    int y = center.y + dy;
+                    int z = center.z + dz;
+                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
+                    if (desired != null) {
+                        // we care about this position
+                        BetterBlockPos pos = new BetterBlockPos(x, y, z);
+                        if (valid(bcc.bsi.get0(x, y, z), desired, false)) {
+                            incorrectPositions.remove(pos);
+                            observedCompleted.add(BetterBlockPos.longHash(pos));
+                        } else {
+                            incorrectPositions.add(pos);
+                            observedCompleted.remove(BetterBlockPos.longHash(pos));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void fullRecalc(BuilderCalculationContext bcc) {
+        incorrectPositions = new HashSet<>();
+        for (int y = 0; y < schematic.heightY(); y++) {
+            for (int z = 0; z < schematic.lengthZ(); z++) {
+                for (int x = 0; x < schematic.widthX(); x++) {
+                    int blockX = x + origin.getX();
+                    int blockY = y + origin.getY();
+                    int blockZ = z + origin.getZ();
+                    IBlockState current = bcc.bsi.get0(blockX, blockY, blockZ);
+                    if (!schematic.inSchematic(x, y, z, current)) {
                         continue;
                     }
-
-                    if (nibble.getUpdating(columnX, currY, columnZ) != 15) {
-                        break;
+                    if (bcc.bsi.worldContainsLoadedChunk(blockX, blockZ)) { // check if its in render distance, not if its in cache
+                        // we can directly observe this block, it is in render distance
+                        if (valid(bcc.bsi.get0(blockX, blockY, blockZ), schematic.desiredState(x, y, z, current, this.approxPlaceable), false)) {
+                            observedCompleted.add(BetterBlockPos.longHash(blockX, blockY, blockZ));
+                        } else {
+                            incorrectPositions.add(new BetterBlockPos(blockX, blockY, blockZ));
+                            observedCompleted.remove(BetterBlockPos.longHash(blockX, blockY, blockZ));
+                            if (incorrectPositions.size() > Baritone.settings().incorrectSize.value) {
+                                return;
+                            }
+                        }
+                        continue;
                     }
-
-                    // delay light set until after processing all sources to setup
-                    this.appendToDecreaseQueue(
-                            ((columnX + (columnZ << 6) + (currY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
-                                    | (15L << (6 + 6 + 16))
-                                    | (propagateDirection << (6 + 6 + 16 + 4))
-                                    // do not set transparent blocks for the same reason we don't in the checkBlock method
-                    );
+                    // this is not in render distance
+                    if (!observedCompleted.contains(BetterBlockPos.longHash(blockX, blockY, blockZ))) {
+                        // and we've never seen this position be correct
+                        // therefore mark as incorrect
+                        incorrectPositions.add(new BetterBlockPos(blockX, blockY, blockZ));
+                        if (incorrectPositions.size() > Baritone.settings().incorrectSize.value) {
+                            return;
+                        }
+                    }
                 }
             }
         }
-
-        // delayed light sets are processed here, and must be processed before checkBlock as checkBlock reads
-        // immediate light value
-        this.processDelayedIncreases();
-        this.processDelayedDecreases();
-
-        for (final BlockPos pos : positions) {
-            this.checkBlock(lightAccess, pos.getX(), pos.getY(), pos.getZ());
-        }
-
-        this.performLightDecrease(lightAccess);
     }
 
-    protected final int[] heightMapGen = new int[32 * 32];
+    private Goal assemble(BuilderCalculationContext bcc, List<IBlockState> approxPlaceable) {
+        return assemble(bcc, approxPlaceable, false);
+    }
+
+    private Goal assemble(BuilderCalculationContext bcc, List<IBlockState> approxPlaceable, boolean logMissing) {
+        List<BetterBlockPos> placeable = new ArrayList<>();
+        List<BetterBlockPos> breakable = new ArrayList<>();
+        List<BetterBlockPos> sourceLiquids = new ArrayList<>();
+        List<BetterBlockPos> flowingLiquids = new ArrayList<>();
+        Map<IBlockState, Integer> missing = new HashMap<>();
+        incorrectPositions.forEach(pos -> {
+            IBlockState state = bcc.bsi.get0(pos);
+            if (state.getBlock() instanceof BlockAir) {
+                if (approxPlaceable.contains(bcc.getSchematic(pos.x, pos.y, pos.z, state))) {
+                    placeable.add(pos);
+                } else {
+                    IBlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, state);
+                    missing.put(desired, 1 + missing.getOrDefault(desired, 0));
+                }
+            } else {
+                if (state.getBlock() instanceof BlockLiquid) {
+                    // if the block itself is JUST a liquid (i.e. not just a waterlogged block), we CANNOT break it
+                    // TODO for 1.13 make sure that this only matches pure water, not waterlogged blocks
+                    if (!MovementHelper.possiblyFlowing(state)) {
+                        // if it's a source block then we want to replace it with a throwaway
+                        sourceLiquids.add(pos);
+                    } else {
+                        flowingLiquids.add(pos);
+                    }
+                } else {
+                    breakable.add(pos);
+                }
+            }
+        });
+        List<Goal> toBreak = new ArrayList<>();
+        breakable.forEach(pos -> toBreak.add(breakGoal(pos, bcc)));
+        List<Goal> toPlace = new ArrayList<>();
+        placeable.forEach(pos -> {
+            if (!placeable.contains(pos.down()) && !placeable.contains(pos.down(2))) {
+                toPlace.add(placementGoal(pos, bcc));
+            }
+        });
+        sourceLiquids.forEach(pos -> toPlace.add(new GoalBlock(pos.up())));
+
+        if (!toPlace.isEmpty()) {
+            return new JankyGoalComposite(new GoalComposite(toPlace.toArray(new Goal[0])), new GoalComposite(toBreak.toArray(new Goal[0])));
+        }
+        if (toBreak.isEmpty()) {
+            if (logMissing && !missing.isEmpty()) {
+                logDirect("Missing materials for at least:");
+                logDirect(missing.entrySet().stream()
+                        .map(e -> String.format("%sx %s", e.getValue(), e.getKey()))
+                        .collect(Collectors.joining("\n")));
+            }
+            if (logMissing && !flowingLiquids.isEmpty()) {
+                logDirect("Unreplaceable liquids at at least:");
+                logDirect(flowingLiquids.stream()
+                        .map(p -> String.format("%s %s %s", p.x, p.y, p.z))
+                        .collect(Collectors.joining("\n")));
+            }
+            return null;
+        }
+        return new GoalComposite(toBreak.toArray(new Goal[0]));
+    }
+
+    public static class JankyGoalComposite implements Goal {
+
+        private final Goal primary;
+        private final Goal fallback;
+
+        public JankyGoalComposite(Goal primary, Goal fallback) {
+            this.primary = primary;
+            this.fallback = fallback;
+        }
+
+
+        @Override
+        public boolean isInGoal(int x, int y, int z) {
+            return primary.isInGoal(x, y, z) || fallback.isInGoal(x, y, z);
+        }
+
+        @Override
+        public double heuristic(int x, int y, int z) {
+            return primary.heuristic(x, y, z);
+        }
+
+        @Override
+        public String toString() {
+            return "JankyComposite Primary: " + primary + " Fallback: " + fallback;
+        }
+    }
+
+    public static class GoalBreak extends GoalGetToBlock {
+
+        public GoalBreak(BlockPos pos) {
+            super(pos);
+        }
+
+        @Override
+        public boolean isInGoal(int x, int y, int z) {
+            // can't stand right on top of a block, that might not work (what if it's unsupported, can't break then)
+            if (y > this.y) {
+                return false;
+            }
+            // but any other adjacent works for breaking, including inside or below
+            return super.isInGoal(x, y, z);
+        }
+    }
+
+    private Goal placementGoal(BlockPos pos, BuilderCalculationContext bcc) {
+        if (ctx.world().getBlockState(pos).getBlock() != Blocks.AIR) { // TODO can this even happen?
+            return new GoalPlace(pos);
+        }
+        boolean allowSameLevel = ctx.world().getBlockState(pos.up()).getBlock() != Blocks.AIR;
+        IBlockState current = ctx.world().getBlockState(pos);
+        for (EnumFacing facing : Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP) {
+            //noinspection ConstantConditions
+            if (MovementHelper.canPlaceAgainst(ctx, pos.offset(facing)) && ctx.world().mayPlace(bcc.getSchematic(pos.getX(), pos.getY(), pos.getZ(), current).getBlock(), pos, false, facing, null)) {
+                return new GoalAdjacent(pos, pos.offset(facing), allowSameLevel);
+            }
+        }
+        return new GoalPlace(pos);
+    }
+
+    private Goal breakGoal(BlockPos pos, BuilderCalculationContext bcc) {
+        if (Baritone.settings().goalBreakFromAbove.value && bcc.bsi.get0(pos.up()).getBlock() instanceof BlockAir && bcc.bsi.get0(pos.up(2)).getBlock() instanceof BlockAir) { // TODO maybe possible without the up(2) check?
+            return new JankyGoalComposite(new GoalBreak(pos), new GoalGetToBlock(pos.up()) {
+                @Override
+                public boolean isInGoal(int x, int y, int z) {
+                    if (y > this.y || (x == this.x && y == this.y && z == this.z)) {
+                        return false;
+                    }
+                    return super.isInGoal(x, y, z);
+                }
+            });
+        }
+        return new GoalBreak(pos);
+    }
+
+    public static class GoalAdjacent extends GoalGetToBlock {
+
+        private boolean allowSameLevel;
+        private BlockPos no;
+
+        public GoalAdjacent(BlockPos pos, BlockPos no, boolean allowSameLevel) {
+            super(pos);
+            this.no = no;
+            this.allowSameLevel = allowSameLevel;
+        }
+
+        public boolean isInGoal(int x, int y, int z) {
+            if (x == this.x && y == this.y && z == this.z) {
+                return false;
+            }
+            if (x == no.getX() && y == no.getY() && z == no.getZ()) {
+                return false;
+            }
+            if (!allowSameLevel && y == this.y - 1) {
+                return false;
+            }
+            if (y < this.y - 1) {
+                return false;
+            }
+            return super.isInGoal(x, y, z);
+        }
+
+        public double heuristic(int x, int y, int z) {
+            // prioritize lower y coordinates
+            return this.y * 100 + super.heuristic(x, y, z);
+        }
+    }
+
+    public static class GoalPlace extends GoalBlock {
+
+        public GoalPlace(BlockPos placeAt) {
+            super(placeAt.up());
+        }
+
+        public double heuristic(int x, int y, int z) {
+            // prioritize lower y coordinates
+            return this.y * 100 + super.heuristic(x, y, z);
+        }
+    }
 
     @Override
-    protected void lightChunk(final LightChunkGetter lightAccess, final ChunkAccess chunk, final boolean needsEdgeChecks) {
-        this.rewriteNibbleCacheForSkylight(chunk);
-        Arrays.fill(this.nullPropagationCheckCache, false);
+    public void onLostControl() {
+        incorrectPositions = null;
+        name = null;
+        schematic = null;
+        realSchematic = null;
+        layer = Baritone.settings().startAtLayer.value;
+        numRepeats = 0;
+        paused = false;
+        observedCompleted = null;
+    }
 
-        final BlockGetter world = lightAccess.getLevel();
-        final ChunkPos chunkPos = chunk.getPos();
-        final int chunkX = chunkPos.x;
-        final int chunkZ = chunkPos.z;
+    @Override
+    public String displayName0() {
+        return paused ? "Builder Paused" : "Building " + name;
+    }
 
-        final LevelChunkSection[] sections = chunk.getSections();
+    private List<IBlockState> approxPlaceable(int size) {
+        List<IBlockState> result = new ArrayList<>();
+        for (int i = 0; i < size; i++) {
+            ItemStack stack = ctx.player().inventory.mainInventory.get(i);
+            if (stack.isEmpty() || !(stack.getItem() instanceof ItemBlock)) {
+                result.add(Blocks.AIR.getDefaultState());
+                continue;
+            }
+            // <toxic cloud>
+            result.add(((ItemBlock) stack.getItem()).getBlock().getStateForPlacement(ctx.world(), ctx.playerFeet(), EnumFacing.UP, (float) ctx.player().posX, (float) ctx.player().posY, (float) ctx.player().posZ, stack.getItem().getMetadata(stack.getMetadata()), ctx.player()));
+            // </toxic cloud>
+        }
+        return result;
+    }
 
-        int highestNonEmptySection = this.maxSection;
-        while (highestNonEmptySection == (this.minSection - 1) ||
-                sections[highestNonEmptySection - this.minSection] == null || sections[highestNonEmptySection - this.minSection].isEmpty()) {
-            this.checkNullSection(chunkX, highestNonEmptySection, chunkZ, false);
-            // try propagate FULL to neighbours
+    private boolean valid(IBlockState current, IBlockState desired, boolean itemVerify) {
+        if (desired == null) {
+            return true;
+        }
+        if (current.getBlock() instanceof BlockLiquid && Baritone.settings().okIfWater.value) {
+            return true;
+        }
+        if (current.getBlock() instanceof BlockAir && Baritone.settings().okIfAir.value.contains(desired.getBlock())) {
+            return true;
+        }
+        if (desired.getBlock() instanceof BlockAir && Baritone.settings().buildIgnoreBlocks.value.contains(current.getBlock())) {
+            return true;
+        }
+        if (!(current.getBlock() instanceof BlockAir) && Baritone.settings().buildIgnoreExisting.value && !itemVerify) {
+            return true;
+        }
+        return current.equals(desired);
+    }
 
-            // check neighbours to see if we need to propagate into them
-            for (final AxisDirection direction : ONLY_HORIZONTAL_DIRECTIONS) {
-                final int neighbourX = chunkX + direction.x;
-                final int neighbourZ = chunkZ + direction.z;
-                final SWMRNibbleArray neighbourNibble = this.getNibbleFromCache(neighbourX, highestNonEmptySection, neighbourZ);
-                if (neighbourNibble == null) {
-                    // unloaded neighbour
-                    // most of the time we fall here
-                    continue;
+    public class BuilderCalculationContext extends CalculationContext {
+
+        private final List<IBlockState> placeable;
+        private final ISchematic schematic;
+        private final int originX;
+        private final int originY;
+        private final int originZ;
+
+        public BuilderCalculationContext() {
+            super(BuilderProcess.this.baritone, true); // wew lad
+            this.placeable = approxPlaceable(9);
+            this.schematic = BuilderProcess.this.schematic;
+            this.originX = origin.getX();
+            this.originY = origin.getY();
+            this.originZ = origin.getZ();
+
+            this.jumpPenalty += 10;
+            this.backtrackCostFavoringCoefficient = 1;
+        }
+
+        private IBlockState getSchematic(int x, int y, int z, IBlockState current) {
+            if (schematic.inSchematic(x - originX, y - originY, z - originZ, current)) {
+                return schematic.desiredState(x - originX, y - originY, z - originZ, current, BuilderProcess.this.approxPlaceable);
+            } else {
+                return null;
+            }
+        }
+
+        @Override
+        public double costOfPlacingAt(int x, int y, int z, IBlockState current) {
+            if (isPossiblyProtected(x, y, z) || !worldBorder.canPlaceAt(x, z)) { // make calculation fail properly if we can't build
+                return COST_INF;
+            }
+            IBlockState sch = getSchematic(x, y, z, current);
+            if (sch != null) {
+                // TODO this can return true even when allowPlace is off.... is that an issue?
+                if (sch.getBlock() == Blocks.AIR) {
+                    // we want this to be air, but they're asking if they can place here
+                    // this won't be a schematic block, this will be a throwaway
+                    return placeBlockCost * 2; // we're going to have to break it eventually
                 }
-
-                // it looks like we need to propagate into the neighbour
-
-                final int incX;
-                final int incZ;
-                final int startX;
-                final int startZ;
-
-                if (direction.x != 0) {
-                    // x direction
-                    incX = 0;
-                    incZ = 1;
-
-                    if (direction.x < 0) {
-                        // negative
-                        startX = chunkX << 4;
-                    } else {
-                        startX = chunkX << 4 | 15;
-                    }
-                    startZ = chunkZ << 4;
+                if (placeable.contains(sch)) {
+                    return 0; // thats right we gonna make it FREE to place a block where it should go in a structure
+                    // no place block penalty at all 😎
+                    // i'm such an idiot that i just tried to copy and paste the epic gamer moment emoji too
+                    // get added to unicode when?
+                }
+                if (!hasThrowaway) {
+                    return COST_INF;
+                }
+                // we want it to be something that we don't have
+                // even more of a pain to place something wrong
+                return placeBlockCost * 3;
+            } else {
+                if (hasThrowaway) {
+                    return placeBlockCost;
                 } else {
-                    // z direction
-                    incX = 1;
-                    incZ = 0;
-
-                    if (direction.z < 0) {
-                        // negative
-                        startZ = chunkZ << 4;
-                    } else {
-                        startZ = chunkZ << 4 | 15;
-                    }
-                    startX = chunkX << 4;
-                }
-
-                final int encodeOffset = this.coordinateOffset;
-                final long propagateDirection = 1L << direction.ordinal(); // we only want to check in this direction
-
-                for (int currY = highestNonEmptySection << 4, maxY = currY | 15; currY <= maxY; ++currY) {
-                    for (int i = 0, currX = startX, currZ = startZ; i < 16; ++i, currX += incX, currZ += incZ) {
-                        this.appendToIncreaseQueue(
-                                ((currX + (currZ << 6) + (currY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
-                                        | (15L << (6 + 6 + 16)) // we know we're at full lit here
-                                        | (propagateDirection << (6 + 6 + 16 + 4))
-                                        // no transparent flag, we know for a fact there are no blocks here that could be directionally transparent (as the section is EMPTY)
-                        );
-                    }
+                    return COST_INF;
                 }
             }
-
-            if (highestNonEmptySection-- == (this.minSection - 1)) {
-                break;
-            }
         }
 
-        if (highestNonEmptySection >= this.minSection) {
-            // fill out our other sources
-
-            // init heightmap
-            // index = (x + 1) + ((z + 1) << 5)
-            final int[] heightMap = this.heightMapGen;
-            final int worldChunkX = chunkPos.x << 4;
-            final int worldChunkZ = chunkPos.z << 4;
-            final int minX = worldChunkX - 1;
-            final int maxX = worldChunkX + 16;
-            final int minZ = worldChunkZ - 1;
-            final int maxZ = worldChunkZ + 16;
-            for (int currZ = minZ; currZ <= maxZ; ++currZ) {
-                for (int currX = minX; currX <= maxX; ++currX) {
-                    int maxY = ((this.minLightSection - 1) << 4);
-
-                    // ensure the section below is always checked
-                    this.checkNullSection(currX >> 4, highestNonEmptySection, currZ >> 4, false);
-                    this.checkNullSection(currX >> 4, highestNonEmptySection - 1, currZ >> 4, false);
-                    for (int sectionY = highestNonEmptySection; sectionY >= 0; --sectionY) {
-                        final LevelChunkSection section = this.getChunkSection(currX >> 4, sectionY, currZ >> 4);
-
-                        if (section == null) {
-                            // unloaded neighbour
-                            continue;
-                        }
-
-                        // ensure the section below is always checked
-                        this.checkNullSection(currX >> 4, sectionY - 1, currZ >> 4, false);
-
-                        final long bitset = ((ExtendedChunkSection)section).getBitsetForColumn(currX & 15, currZ & 15);
-                        if (bitset == 0) {
-                            continue;
-                        }
-
-                        final int highestBitSet = 63 ^ Long.numberOfLeadingZeros(bitset); // from [0, 63]
-                        final int highestYValue = highestBitSet >>> 1; // y = highest bit set / bits per block
-                        maxY = highestYValue | (sectionY << 4);
-                        break;
-                    }
-                    heightMap[(currX - worldChunkX + 1) | ((currZ - worldChunkZ + 1) << 5)] = maxY;
+        @Override
+        public double breakCostMultiplierAt(int x, int y, int z, IBlockState current) {
+            if (!allowBreak || isPossiblyProtected(x, y, z)) {
+                return COST_INF;
+            }
+            IBlockState sch = getSchematic(x, y, z, current);
+            if (sch != null) {
+                if (sch.getBlock() == Blocks.AIR) {
+                    // it should be air
+                    // regardless of current contents, we can break it
+                    return 1;
                 }
-            }
+                // it should be a real block
+                // is it already that block?
+                if (valid(bsi.get0(x, y, z), sch, false)) {
+                    return Baritone.settings().breakCorrectBlockPenaltyMultiplier.value;
+                } else {
+                    // can break if it's wrong
+                    // would be great to return less than 1 here, but that would actually make the cost calculation messed up
+                    // since we're breaking a block, if we underestimate the cost, then it'll fail when it really takes the correct amount of time
+                    return 1;
 
-            // now setup sources
-            final int encodeOffset = this.coordinateOffset;
-            for (int currZ = 0; currZ <= 15; ++currZ) {
-                for (int currX = 0; currX <= 15; ++currX) {
-                    final int worldX = currX | worldChunkX;
-                    final int worldZ = currZ | worldChunkZ;
-                    // NX = -1 on x
-                    // PX = +1 on x
-                    // NZ = -1 on z
-                    // PZ = +1 on z
-                    // C = center
-
-                    // index = (x + 1) | ((z + 1) << 5)
-
-                    // X = 0, Z = 0
-                    final int heightMapC  = heightMap[(currX + 1) | ((currZ + 1) << 5)];
-
-                    // X = -1
-                    final int heightMapNX = heightMap[(currX - 1 + 1) | ((currZ + 1) << 5)];
-
-                    // X = 1
-                    final int heightMapPX = heightMap[(currX + 1 + 1) | ((currZ + 1) << 5)];
-
-                    // Z = -1
-                    final int heightMapNZ = heightMap[(currX + 1) | ((currZ - 1 + 1) << 5)];
-
-                    // Z = 1
-                    final int heightMapPZ = heightMap[(currX + 1) | ((currZ + 1 + 1) << 5)];
-
-                    for (int currY = (highestNonEmptySection << 4) + 16; currY > heightMapC;) {
-                        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, currY >> 4, chunkZ);
-                        if (nibble == null) {
-                            // skip this section, has no data
-                            currY = (currY - 16) & (~15);
-                            continue;
-                        }
-
-                        long propagateDirectionBitset = 0L;
-                        // +X
-                        propagateDirectionBitset |= ((currY <= heightMapPX) ? 1L : 0L) << AxisDirection.POSITIVE_X.ordinal();
-
-                        // -X
-                        propagateDirectionBitset |= ((currY <= heightMapNX) ? 1L : 0L) << AxisDirection.NEGATIVE_X.ordinal();
-
-                        // +Z
-                        propagateDirectionBitset |= ((currY <= heightMapPZ) ? 1L : 0L) << AxisDirection.POSITIVE_Z.ordinal();
-
-                        // -Z
-                        propagateDirectionBitset |= ((currY <= heightMapNZ) ? 1L : 0L) << AxisDirection.NEGATIVE_Z.ordinal();
-
-                        // +Y is always 0 since we don't want to check upwards
-
-                        // -Y:
-                        propagateDirectionBitset |= ((currY == (heightMapC + 1)) ? 1L : 0L) << AxisDirection.NEGATIVE_Y.ordinal();
-
-                        // now setup source
-                        // unlike block checks, we don't use FORCE_WRITE here because our init doesn't rely on above nibbles
-                        // when initialising
-                        nibble.set((worldX & 15) | ((worldZ & 15) << 4) | ((currY & 15) << 8), 15);
-                        if (propagateDirectionBitset != 0L) {
-                            this.appendToIncreaseQueue(
-                                    ((worldX + (worldZ << 6) + (currY << 12) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
-                                            | (15L << (6 + 6 + 16))
-                                            | propagateDirectionBitset << (6 + 6 + 16 + 4)
-                                            // above heightmap, so not sidedly transparent
-                            );
-                        }
-
-                        --currY;
-                    }
-
-                    // Just in case there's a conditionally transparent block at the top.
-                    this.tryPropagateSkylight(world, worldX, heightMapC, worldZ, false, false);
                 }
-            }
-        } // else: apparently the chunk is empty
-
-        if (needsEdgeChecks) {
-            // not required to propagate here, but this will reduce the hit of the edge checks
-            this.performLightIncrease(lightAccess);
-
-            for (int y = highestNonEmptySection; y >= this.minLightSection; --y) {
-                this.checkNullSection(chunkX, y, chunkZ, false);
-            }
-            // no need to rewrite the nibble cache again
-            super.checkChunkEdges(lightAccess, chunk, this.minLightSection, highestNonEmptySection);
-        } else {
-            for (int y = highestNonEmptySection; y >= this.minLightSection; --y) {
-                this.checkNullSection(chunkX, y, chunkZ, false);
-            }
-            this.propagateNeighbourLevels(lightAccess, chunk, this.minLightSection, highestNonEmptySection);
-
-            this.performLightIncrease(lightAccess);
-        }
-    }
-
-    protected final void processDelayedIncreases() {
-        // copied from performLightIncrease
-        final long[] queue = this.increaseQueue;
-        final int decodeOffsetX = -this.encodeOffsetX;
-        final int decodeOffsetY = -this.encodeOffsetY;
-        final int decodeOffsetZ = -this.encodeOffsetZ;
-
-        for (int i = 0, len = this.increaseQueueInitialLength; i < len; ++i) {
-            final long queueValue = queue[i];
-
-            final int posX = ((int)queueValue & 63) + decodeOffsetX;
-            final int posZ = (((int)queueValue >>> 6) & 63) + decodeOffsetZ;
-            final int posY = (((int)queueValue >>> 12) & ((1 << 16) - 1)) + decodeOffsetY;
-            final int propagatedLightLevel = (int)((queueValue >>> (6 + 6 + 16)) & 0xF);
-
-            this.setLightLevel(posX, posY, posZ, propagatedLightLevel);
-        }
-    }
-
-    protected final void processDelayedDecreases() {
-        // copied from performLightDecrease
-        final long[] queue = this.decreaseQueue;
-        final int decodeOffsetX = -this.encodeOffsetX;
-        final int decodeOffsetY = -this.encodeOffsetY;
-        final int decodeOffsetZ = -this.encodeOffsetZ;
-
-        for (int i = 0, len = this.decreaseQueueInitialLength; i < len; ++i) {
-            final long queueValue = queue[i];
-
-            final int posX = ((int)queueValue & 63) + decodeOffsetX;
-            final int posZ = (((int)queueValue >>> 6) & 63) + decodeOffsetZ;
-            final int posY = (((int)queueValue >>> 12) & ((1 << 16) - 1)) + decodeOffsetY;
-
-            this.setLightLevel(posX, posY, posZ, 0);
-        }
-    }
-
-    // delaying the light set is useful for block changes since they need to worry about initialising nibblearrays
-    // while also queueing light at the same time (initialising nibblearrays might depend on nibbles above, so
-    // clobbering the light values will result in broken propagation)
-    protected final int tryPropagateSkylight(final BlockGetter world, final int worldX, int startY, final int worldZ,
-                                             final boolean extrudeInitialised, final boolean delayLightSet) {
-        final BlockPos.MutableBlockPos mutablePos = this.mutablePos3;
-        final int encodeOffset = this.coordinateOffset;
-        final long propagateDirection = AxisDirection.POSITIVE_Y.everythingButThisDirection; // just don't check upwards.
-
-        if (this.getLightLevelExtruded(worldX, startY + 1, worldZ) != 15) {
-            return startY;
-        }
-
-        // ensure this section is always checked
-        this.checkNullSection(worldX >> 4, startY >> 4, worldZ >> 4, extrudeInitialised);
-
-        BlockState above = this.getBlockState(worldX, startY + 1, worldZ);
-        if (above == null) {
-            above = AIR_BLOCK_STATE;
-        }
-
-        for (;startY >= (this.minLightSection << 4); --startY) {
-            if ((startY & 15) == 15) {
-                // ensure this section is always checked
-                this.checkNullSection(worldX >> 4, startY >> 4, worldZ >> 4, extrudeInitialised);
-            }
-            BlockState current = this.getBlockState(worldX, startY, worldZ);
-            if (current == null) {
-                current = AIR_BLOCK_STATE;
-            }
-
-            final VoxelShape fromShape;
-            if (((ExtendedAbstractBlockState)above).isConditionallyFullOpaque()) {
-                this.mutablePos2.set(worldX, startY + 1, worldZ);
-                fromShape = above.getFaceOcclusionShape(world, this.mutablePos2, AxisDirection.NEGATIVE_Y.nms);
-                if (Shapes.faceShapeOccludes(Shapes.empty(), fromShape)) {
-                    // above wont let us propagate
-                    break;
-                }
+                // TODO do blocks in render distace only?
+                // TODO allow breaking blocks that we have a tool to harvest and immediately place back?
             } else {
-                fromShape = Shapes.empty();
-            }
-
-            final int opacityIfCached = ((ExtendedAbstractBlockState)current).getOpacityIfCached();
-            // does light propagate from the top down?
-            if (opacityIfCached != -1) {
-                if (opacityIfCached != 0) {
-                    // we cannot propagate 15 through this
-                    break;
-                }
-                // most of the time it falls here.
-                // add to propagate
-                // light set delayed until we determine if this nibble section is null
-                this.appendToIncreaseQueue(
-                        ((worldX + (worldZ << 6) + (startY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
-                                | (15L << (6 + 6 + 16)) // we know we're at full lit here
-                                | (propagateDirection << (6 + 6 + 16 + 4))
-                );
-            } else {
-                mutablePos.set(worldX, startY, worldZ);
-                long flags = 0L;
-                if (((ExtendedAbstractBlockState)current).isConditionallyFullOpaque()) {
-                    final VoxelShape cullingFace = current.getFaceOcclusionShape(world, mutablePos, AxisDirection.POSITIVE_Y.nms);
-
-                    if (Shapes.faceShapeOccludes(fromShape, cullingFace)) {
-                        // can't propagate here, we're done on this column.
-                        break;
-                    }
-                    flags |= FLAG_HAS_SIDED_TRANSPARENT_BLOCKS;
-                }
-
-                final int opacity = current.getLightBlock(world, mutablePos);
-                if (opacity > 0) {
-                    // let the queued value (if any) handle it from here.
-                    break;
-                }
-
-                // light set delayed until we determine if this nibble section is null
-                this.appendToIncreaseQueue(
-                        ((worldX + (worldZ << 6) + (startY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
-                                | (15L << (6 + 6 + 16)) // we know we're at full lit here
-                                | (propagateDirection << (6 + 6 + 16 + 4))
-                                | flags
-                );
-            }
-
-            above = current;
-
-            if (this.getNibbleFromCache(worldX >> 4, startY >> 4, worldZ >> 4) == null) {
-                // we skip empty sections here, as this is just an easy way of making sure the above block
-                // can propagate through air.
-
-                // nothing can propagate in null sections, remove the queue entry for it
-                --this.increaseQueueInitialLength;
-
-                // advance currY to the the top of the section below
-                startY = (startY) & (~15);
-                // note: this value ^ is actually 1 above the top, but the loop decrements by 1 so we actually
-                // end up there
-
-                // make sure this is marked as AIR
-                above = AIR_BLOCK_STATE;
-            } else if (!delayLightSet) {
-                this.setLightLevel(worldX, startY, worldZ, 15);
+                return 1; // why not lol
             }
         }
-
-        return startY;
     }
 }
